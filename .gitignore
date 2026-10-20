@@ -1,0 +1,12 @@
+# build outputs
+build/
+baseline/
+*.log
+qemu.pid
+
+# python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store

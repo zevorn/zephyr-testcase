@@ -1,0 +1,226 @@
+# virtio-net VLAN RX test - managed with just
+#
+# Run from this directory (virtio-net-vlan-test/):
+#   just                 list all recipes
+#   just doctor          check build/run dependencies
+#   just build           build the test app against ../../zephyr-virtio
+#   just test            build + start QEMU + inject frames + assert PASS
+#   just demo            before/after: patched tree PASS, upstream/main FAIL
+#   just qemu            start QEMU manually (then just inject / just inject-vlan)
+#   just clean           remove build/ and baseline/
+
+set shell := ["bash", "-uc"]
+
+# The test application lives in the same directory as this justfile
+app := justfile_directory()
+
+# Zephyr tree under test; override with the ZEPHYR_BASE environment variable
+zephyr_base := env_var_or_default("ZEPHYR_BASE", justfile_directory() + "/../../zephyr-virtio")
+
+# host.py / inject.py only need the standard library, so plain python3 is fine
+python := env_var_or_default("PYTHON", "python3")
+qemu := env_var_or_default("QEMU", "qemu-system-riscv64")
+
+board := env_var_or_default("BOARD", "qemu_riscv64")
+port := env_var_or_default("VNET_PORT", "45987")
+cpu := env_var_or_default("QEMU_CPU", "rv64i,i=on,m=on,a=on,f=on,d=on,c=on,zicsr=on,zifencei=on,zicntr=on,zkr=on,pmp=on,u=on")
+
+build_root := justfile_directory() + "/build"
+baseline_dir := justfile_directory() + "/baseline"
+build_dir := build_root + "/" + file_name(zephyr_base)
+elf := build_dir + "/zephyr/zephyr.elf"
+
+# List all available recipes
+default:
+    @just --list --unsorted
+
+alias run := test
+
+# Show the paths and tools currently in use
+info:
+    @echo "app          = {{app}}"
+    @echo "ZEPHYR_BASE  = {{zephyr_base}}"
+    @echo "build dir    = {{build_dir}}"
+    @echo "ELF          = {{elf}}"
+    @echo "python       = {{python}}"
+    @echo "qemu         = {{qemu}}"
+    @echo "board        = {{board}}"
+    @echo "netdev port  = {{port}}"
+
+# Check that the required tools are available
+doctor:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    rc=0
+    check() {
+        name="$1"; shift
+        if "$@" >/dev/null 2>&1; then printf '  ok    %s\n' "$name"; else printf '  FAIL  %s\n' "$name"; rc=1; fi
+    }
+    echo "Dependencies:"
+    check "just" just --version
+    check "cmake" cmake --version
+    check "ninja" ninja --version
+    check "qemu-system-riscv64" "{{qemu}}" --version
+    if [ -f "{{zephyr_base}}/VERSION" ]; then
+        echo "  ok    Zephyr tree: {{zephyr_base}}"
+    else
+        echo "  FAIL  Zephyr tree: {{zephyr_base}} (set ZEPHYR_BASE)"; rc=1
+    fi
+    if [ -f "{{app}}/CMakeLists.txt" ]; then
+        echo "  ok    test app: {{app}}"
+    else
+        echo "  FAIL  test app: {{app}}"; rc=1
+    fi
+    if [ -x /tmp/zvenv/bin/python3 ]; then
+        PYCHK=/tmp/zvenv/bin/python3
+        echo "  ok    build python: /tmp/zvenv/bin/python3"
+    else
+        PYCHK="$(command -v python3 || true)"
+        echo "  warn  /tmp/zvenv not found, build will use: $PYCHK"
+    fi
+    if [ -n "$PYCHK" ] && "$PYCHK" -c 'import packaging, elftools, yaml, pykwalify' >/dev/null 2>&1; then
+        echo "  ok    python build deps"
+    else
+        echo "  FAIL  python build deps (need packaging, pyelftools, PyYAML, pykwalify)"; rc=1
+    fi
+    if [ "$rc" -ne 0 ]; then
+        echo; echo "Some dependencies are missing, see above."; exit 1
+    fi
+    echo; echo "All good."
+
+# Build the test app against the current ZEPHYR_BASE tree
+build:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -f "{{zephyr_base}}/VERSION" ]; then
+        echo "ERROR: Zephyr tree not found: {{zephyr_base}}" >&2
+        echo "       specify it with ZEPHYR_BASE=/path/to/zephyr just build" >&2
+        exit 1
+    fi
+    if [ -x /tmp/zvenv/bin/python3 ]; then
+        export PATH="/tmp/zvenv/bin:$PATH"
+    fi
+    py="$(command -v python3)"
+    echo "==> Building: {{zephyr_base}}"
+    echo "    python: $py"
+    ZEPHYR_BASE="{{zephyr_base}}" cmake -GNinja -S "{{app}}" -B "{{build_dir}}" \
+        -DBOARD={{board}} -DPython3_EXECUTABLE="$py"
+    cmake --build "{{build_dir}}" --parallel
+    echo "==> ELF: {{elf}}"
+
+# Build against an arbitrary Zephyr tree (e.g. ../../zephyr, /path/to/pristine)
+build-tree dir:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tree="$(cd "{{dir}}" && pwd)"
+    bdir="{{build_root}}/$(basename "$tree")"
+    if [ -x /tmp/zvenv/bin/python3 ]; then
+        export PATH="/tmp/zvenv/bin:$PATH"
+    fi
+    py="$(command -v python3)"
+    bver=""
+    if [ ! -d "$tree/.git" ]; then
+        bver="-DBUILD_VERSION=upstream-main"
+    fi
+    echo "==> Building: $tree"
+    ZEPHYR_BASE="$tree" cmake -GNinja -S "{{app}}" -B "$bdir" \
+        -DBOARD={{board}} -DPython3_EXECUTABLE="$py" $bver
+    cmake --build "$bdir" --parallel
+    echo "==> ELF: $bdir/zephyr/zephyr.elf"
+
+# Run the end-to-end test: build + QEMU + frame injection (expects PASS)
+test: build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "==> Starting QEMU and injecting a 1514B plain frame and a 1518B VLAN frame (expect PASS)"
+    QEMU="{{qemu}}" QEMU_CPU="{{cpu}}" VNET_PORT="{{port}}" \
+        "{{python}}" "{{app}}/host.py" "{{elf}}" "patched"
+
+# Run the end-to-end test against an arbitrary Zephyr tree
+test-tree dir:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tree="$(cd "{{dir}}" && pwd)"
+    bdir="{{build_root}}/$(basename "$tree")"
+    if [ ! -f "$bdir/zephyr/zephyr.elf" ]; then
+        just build-tree "$tree"
+    fi
+    QEMU="{{qemu}}" QEMU_CPU="{{cpu}}" VNET_PORT="{{port}}" \
+        "{{python}}" "{{app}}/host.py" "$bdir/zephyr/zephyr.elf" "$(basename "$tree")"
+
+# Export upstream/main from the current Zephyr tree into baseline/
+baseline:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    rm -rf "{{baseline_dir}}"
+    mkdir -p "{{baseline_dir}}"
+    git -C "{{zephyr_base}}" archive upstream/main | tar -x -C "{{baseline_dir}}"
+    echo "==> Exported upstream/main baseline to: {{baseline_dir}}"
+
+# Run the test against unmodified upstream/main (expected FAIL, reproduces the bug)
+test-before: baseline
+    #!/usr/bin/env bash
+    set -uo pipefail
+    if ! just build-tree "{{baseline_dir}}"; then
+        echo "ERROR: baseline build failed" >&2
+        exit 2
+    fi
+    QEMU="{{qemu}}" QEMU_CPU="{{cpu}}" VNET_PORT="{{port}}" \
+        "{{python}}" "{{app}}/host.py" "{{build_root}}/baseline/zephyr/zephyr.elf" "upstream/main"
+    rc=$?
+    if [ "$rc" -eq 1 ]; then
+        echo "==> OK: upstream/main does not receive the VLAN frame (bug reproduced, FAIL as expected)"
+        exit 0
+    fi
+    if [ "$rc" -eq 0 ]; then
+        echo "==> UNEXPECTED: upstream/main passed, bug not reproduced?"
+        exit 1
+    fi
+    echo "==> UNEXPECTED: test harness error (rc=$rc)"
+    exit 2
+
+# One-shot before/after demo
+demo:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    echo "=== 1/2 current tree (expect PASS) ==="
+    if just test; then r1="PASS"; else r1="FAIL"; fi
+    echo
+    echo "=== 2/2 upstream/main baseline (expect FAIL, reproduces the bug) ==="
+    if just test-before; then r2="bug reproduced (expected)"; else r2="UNEXPECTED"; fi
+    echo
+    echo "current tree: $r1"
+    echo "baseline:     $r2"
+    if [ "$r1" = "PASS" ] && [ "$r2" = "bug reproduced (expected)" ]; then
+        echo "==> demo OK"
+        exit 0
+    fi
+    exit 1
+
+# Start QEMU in the foreground for manual testing
+qemu: build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "QEMU is starting. In another terminal run:"
+    echo "  just inject        # inject one plain 1514B frame"
+    echo "  just inject-vlan   # inject one VLAN-tagged 1518B frame"
+    echo "socket netdev listening on: 127.0.0.1:{{port}}"
+    exec "{{qemu}}" -machine virt -bios none -m 256 -cpu "{{cpu}}" \
+        -global virtio-mmio.force-legacy=false \
+        -chardev stdio,id=con,mux=on -serial chardev:con \
+        -mon chardev=con,mode=readline -nographic -no-reboot \
+        -netdev "socket,id=n1,listen=127.0.0.1:{{port}}" \
+        -device "virtio-net-device,netdev=n1,bus=virtio-mmio-bus.0" \
+        -kernel "{{elf}}"
+
+# Inject one plain 1514-byte frame into the running QEMU
+inject:
+    "{{python}}" "{{app}}/inject.py" --port {{port}}
+
+# Inject one VLAN-tagged 1518-byte frame into the running QEMU
+inject-vlan:
+    "{{python}}" "{{app}}/inject.py" --port {{port}} --vlan
+
+# Remove build artifacts and the baseline tree
+clean:
+    rm -rf "{{build_root}}" "{{baseline_dir}}"
