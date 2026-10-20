@@ -2,7 +2,7 @@
 
 Verifies that the Zephyr virtio-net driver can receive a full 1518-byte
 VLAN-tagged frame when CONFIG_NET_VLAN is enabled. Corresponds to Zephyr patch
-fd64c2f22d3f ("fix frame buffer size for tagged frames").
+df7fa241d366 ("fix frame buffer size for tagged frames").
 
 Everything is managed by the justfile in this directory.
 
