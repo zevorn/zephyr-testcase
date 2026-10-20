@@ -13,11 +13,23 @@ patch 49dfc3e50952 ("fix frame buffer size for tagged frames").
 
 See virtio-net-vlan-test/README.md for details.
 
-Quick start:
+### virtio-net-tx-overrun-test
+
+Verifies that the Zephyr virtio-net driver rejects frames that do not fit into
+its TX buffer. It corresponds to Zephyr PR #122791 ("fix TX buffer overrun for
+oversized frames") and issue #122790.
+
+See virtio-net-tx-overrun-test/README.md for details.
+
+## Quick start
 
     cd virtio-net-vlan-test
     just doctor
     just test
 
+    cd ../virtio-net-tx-overrun-test
+    ZEPHYR_BASE=../../zephyr-virtio-tx just doctor
+    ZEPHYR_BASE=../../zephyr-virtio-tx just test
+
 Build artifacts (build/) and the upstream/main snapshot (baseline/) are created
-inside the test directory and are gitignored.
+inside each test directory and are gitignored.
